@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "stocky"
+version = "0.1.0"
+description = "Professional stock market TUI for traders"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = [
+    "textual>=0.29.0",
+    "yfinance>=0.2.0",
+    "plotext>=5.0.0",
+    "pandas>=1.5.0",
+    "rich>=13.0.0",
+]
+
+[project.scripts]
+stocky = "stocky.main:run"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["stocky*"]
