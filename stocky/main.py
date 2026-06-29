@@ -192,16 +192,64 @@ def _plt_build():
         plt.show(); sys.stdout = old
         return buf.getvalue()
 
-def _claude_client():
-    """Return anthropic client if API key is available."""
+def _stream_claude(system, messages, on_text, on_done, on_error):
+    """Stream a Claude response via the `claude` CLI (uses existing login).
+    Calls on_text(chunk) for each text delta, on_done() when finished,
+    on_error(msg) on failure.
+    """
+    import subprocess, json as _json, shutil
+
+    if not shutil.which("claude"):
+        on_error("claude CLI not found — install Claude Code first")
+        return
+
+    # Build prompt: system context + full message history
+    parts = []
+    if system:
+        parts.append(f"<system_instructions>\n{system}\n</system_instructions>\n\n")
+    for msg in messages:
+        tag = "Human" if msg["role"] == "user" else "Assistant"
+        parts.append(f"{tag}: {msg['content']}\n\n")
+    full_prompt = "".join(parts).rstrip()
+
+    cmd = [
+        "claude", "-p",
+        "--output-format", "stream-json",
+        "--include-partial-messages",
+        "--verbose",
+        "--bare",               # skip hooks/CLAUDE.md, lean mode
+        full_prompt,
+    ]
     try:
-        import anthropic
-        key = os.environ.get("ANTHROPIC_API_KEY","")
-        if not key:
-            return None, "Set ANTHROPIC_API_KEY env var to enable AI analysis"
-        return anthropic.Anthropic(api_key=key), None
-    except ImportError:
-        return None, "Run: pip install anthropic"
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, bufsize=1,
+        )
+        for line in proc.stdout:
+            line = line.strip()
+            if not line: continue
+            try:
+                obj = _json.loads(line)
+                # Stream text deltas
+                if obj.get("type") == "stream_event":
+                    ev = obj.get("event", {})
+                    if ev.get("type") == "content_block_delta":
+                        delta = ev.get("delta", {})
+                        if delta.get("type") == "text_delta":
+                            on_text(delta.get("text", ""))
+                # Final result (non-streaming fallback)
+                elif obj.get("type") == "result" and obj.get("subtype") == "success":
+                    if not obj.get("result", ""):
+                        pass  # already streamed
+            except (_json.JSONDecodeError, KeyError):
+                pass
+        proc.wait()
+        if proc.returncode not in (0, None):
+            err = proc.stderr.read().strip()
+            if err: on_error(err); return
+        on_done()
+    except Exception as exc:
+        on_error(str(exc))
 
 def _build_stock_context(sym, info, hist, signals_data, financials):
     """Build a rich context string for Claude from stock data."""
@@ -1062,15 +1110,6 @@ class StockApp(App):
         w.update(text)
 
     def _load_ai_analysis(self, sym):
-        client, err = _claude_client()
-        if not client:
-            self.call_from_thread(self._ai_set,
-                f"[red]{err}[/red]\n\n"
-                f"[#6c7086]Export your API key and restart:\n"
-                f"  export ANTHROPIC_API_KEY=sk-ant-...[/#6c7086]")
-            self.call_from_thread(self.query_one("#ai-status").update, "")
-            return
-
         info_c = self._info_cache.get(sym, {})
         info   = info_c.get("info", {}) if info_c else {}
         hist   = self._hist_cache.get((sym, self._cur_tf))
@@ -1081,76 +1120,45 @@ class StockApp(App):
             try: sigs_data = _signals(hist["Close"].tolist())
             except Exception: pass
 
-        context = _build_stock_context(sym, info, hist, sigs_data, fin)
-        history = self._ai_history.get(sym, [])
+        context  = _build_stock_context(sym, info, hist, sigs_data, fin)
+        system   = (
+            "You are a professional financial analyst assistant embedded in a stock trading terminal. "
+            "Provide concise, actionable analysis. Use plain text only (no markdown, no bullet symbols, "
+            "no headers with # or *). "
+            "Structure: Quick summary (2-3 sentences), Key strengths, Key risks, "
+            "Technical outlook, Verdict. Be direct. No disclaimers."
+        )
+        user_msg = f"Analyze this stock:\n\n{context}"
+        messages = [{"role": "user", "content": user_msg}]
 
-        if not history:
-            # First open — generate initial analysis
-            system = (
-                "You are a professional financial analyst assistant embedded in a stock trading terminal. "
-                "Provide concise, actionable analysis. Use plain text (no markdown headers). "
-                "Structure your response: 1) Quick summary (2-3 sentences), "
-                "2) Key strengths, 3) Key risks, 4) Technical outlook, 5) Verdict. "
-                "Be direct and specific. Avoid generic disclaimers."
-            )
-            user_msg = f"Analyze this stock:\n\n{context}"
-        else:
-            system = (
-                "You are a professional financial analyst assistant embedded in a stock trading terminal. "
-                "Answer questions about stocks concisely and directly. Use plain text."
-            )
-            user_msg = history[-1]["content"] if history else "Summarize this stock."
-
-        messages = []
-        if history:
-            messages = history[:-1]
-        messages.append({"role": "user", "content": user_msg if not history else history[-1]["content"]})
-
-        # For initial analysis, no prior history
-        if not history:
-            messages = [{"role": "user", "content": user_msg}]
-
-        self.call_from_thread(self._ai_set,
-            f"[bold #89b4fa]AI Analysis — {sym}[/bold #89b4fa]\n\n")
+        header = f"[bold #89b4fa]AI Analysis — {sym}[/bold #89b4fa]\n\n"
+        self.call_from_thread(self._ai_set, header)
         self.call_from_thread(self.query_one("#ai-status").update,
             "[#f9e2af]Claude is thinking…[/#f9e2af]")
 
-        try:
-            full_response = ""
-            with client.messages.stream(
-                model="claude-sonnet-4-6",
-                max_tokens=1024,
-                system=system,
-                messages=messages,
-            ) as stream:
-                for text in stream.text_stream:
-                    full_response += text
-                    self.call_from_thread(self._ai_set,
-                        f"[bold #89b4fa]AI Analysis — {sym}[/bold #89b4fa]\n\n"
-                        + full_response)
+        acc = {"text": ""}
 
-            # Save to history
-            if not history:
-                self._ai_history[sym] = [
-                    {"role": "user",      "content": user_msg},
-                    {"role": "assistant", "content": full_response},
-                ]
+        def on_text(chunk):
+            acc["text"] += chunk
+            self.call_from_thread(self._ai_set, header + acc["text"])
+
+        def on_done():
+            self._ai_history[sym] = [
+                {"role": "user",      "content": user_msg},
+                {"role": "assistant", "content": acc["text"]},
+            ]
             self.call_from_thread(self.query_one("#ai-status").update,
                 "[#6c7086]Type a question below and press Enter[/#6c7086]")
-        except Exception as exc:
+
+        def on_error(msg):
             self.call_from_thread(self._ai_set,
-                f"[bold #89b4fa]AI Analysis — {sym}[/bold #89b4fa]\n\n"
-                f"[red]Error: {exc}[/red]")
+                header + f"[red]Error: {msg}[/red]")
             self.call_from_thread(self.query_one("#ai-status").update, "")
 
-    def _ask_claude(self, sym, question):
-        client, err = _claude_client()
-        if not client:
-            self.call_from_thread(self._ai_append,
-                f"\n\n[red]No API key: {err}[/red]")
-            return
+        _stream_claude(system, messages, on_text, on_done, on_error)
 
-        history = self._ai_history.get(sym, [])
+    def _ask_claude(self, sym, question):
+        history = list(self._ai_history.get(sym, []))
         history.append({"role": "user", "content": question})
 
         self.call_from_thread(self._ai_append,
@@ -1159,25 +1167,24 @@ class StockApp(App):
         self.call_from_thread(self.query_one("#ai-status").update,
             "[#f9e2af]Thinking…[/#f9e2af]")
 
-        try:
-            response = ""
-            with client.messages.stream(
-                model="claude-sonnet-4-6",
-                max_tokens=1024,
-                system="You are a professional financial analyst. Answer concisely in plain text.",
-                messages=history,
-            ) as stream:
-                for text in stream.text_stream:
-                    response += text
-                    self.call_from_thread(self._ai_append, text)
+        system  = "You are a professional financial analyst. Answer concisely in plain text. No markdown."
+        acc     = {"text": ""}
 
-            history.append({"role": "assistant", "content": response})
+        def on_text(chunk):
+            acc["text"] += chunk
+            self.call_from_thread(self._ai_append, chunk)
+
+        def on_done():
+            history.append({"role": "assistant", "content": acc["text"]})
             self._ai_history[sym] = history
             self.call_from_thread(self.query_one("#ai-status").update,
                 "[#6c7086]Type a question and press Enter[/#6c7086]")
-        except Exception as exc:
-            self.call_from_thread(self._ai_append, f"[red]Error: {exc}[/red]")
+
+        def on_error(msg):
+            self.call_from_thread(self._ai_append, f"[red]Error: {msg}[/red]")
             self.call_from_thread(self.query_one("#ai-status").update, "")
+
+        _stream_claude(system, history, on_text, on_done, on_error)
 
     # ── Alert loop ──────────────────────────────────────────────────────────────
     def _alert_loop(self):
