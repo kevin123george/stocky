@@ -217,7 +217,6 @@ def _stream_claude(system, messages, on_text, on_done, on_error):
         "--output-format", "stream-json",
         "--include-partial-messages",
         "--verbose",
-        "--bare",               # skip hooks/CLAUDE.md, lean mode
         full_prompt,
     ]
     try:
