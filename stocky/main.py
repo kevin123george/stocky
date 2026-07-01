@@ -5,6 +5,8 @@ import sys, threading, io, json, os, time, base64
 from datetime import datetime
 from pathlib import Path
 from rich.ansi import AnsiDecoder
+from rich.segment import Segment
+from textual.strip import Strip
 
 from textual.app import App, ComposeResult
 from textual.widgets import (
@@ -467,57 +469,74 @@ def _build_stock_context(sym, info, hist, signals_data, financials):
 
 
 # ── Chart widget (Kitty graphics + plotext fallback) ───────────────────────────
-class ChartWidget(Static):
-    """Renders either a matplotlib PNG via Kitty protocol or plotext text."""
+class ChartWidget(Widget):
+    """Renders a matplotlib PNG via Kitty graphics protocol or plotext ANSI text.
+
+    Uses render_line() + Rich control Segments so the Kitty escape is emitted
+    atomically inside Textual's own render stream — no timing races.
+    """
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._png: bytes | None = None
+        self._kitty_seq: str   = ""
+        self._ansi_lines: list  = []   # decoded Rich Text lines for plotext fallback
 
+    # ── Public API ─────────────────────────────────────────────────────────────
     def set_png(self, png: bytes):
-        self._png = png
-        self.update("")      # clear any old plotext text
+        self._png       = png
+        self._ansi_lines = []
+        self._kitty_seq  = self._encode(png)
         self.refresh()
 
     def set_plotext(self, text):
-        self._png = None
-        self.update(text)
+        self._png        = None
+        self._kitty_seq  = ""
+        self._ansi_lines = list(_ansi.decode(text)) if text else []
+        self.refresh()
 
-    def render(self):
-        if self._png:
-            self.app.call_after_refresh(self._place_kitty)
-            return ""
-        return super().render()
+    # ── Encoding ───────────────────────────────────────────────────────────────
+    def _encode(self, png: bytes) -> str:
+        w = max(self.size.width,  1)
+        h = max(self.size.height, 1)
+        data   = base64.standard_b64encode(png).decode()
+        chunks = [data[i:i + 4096] for i in range(0, len(data), 4096)]
+        parts  = []
+        for i, c in enumerate(chunks):
+            m = 0 if i == len(chunks) - 1 else 1
+            if i == 0:
+                parts.append(f"\x1b_Ga=T,f=100,c={w},r={h},m={m},q=2;{c}\x1b\\")
+            else:
+                parts.append(f"\x1b_Gm={m},q=2;{c}\x1b\\")
+        return "".join(parts)
 
-    def _place_kitty(self):
-        if not self._png:
-            return
-        try:
-            r = self.region
-            w, h = r.width, r.height
-            if w <= 0 or h <= 0:
-                return
-            data   = base64.standard_b64encode(self._png).decode()
-            chunks = [data[i:i + 4096] for i in range(0, len(data), 4096)]
-            parts  = [f"\x1b[{r.y + 1};{r.x + 1}H"]
-            for i, chunk in enumerate(chunks):
-                m = 0 if i == len(chunks) - 1 else 1
-                if i == 0:
-                    parts.append(
-                        f"\x1b_Ga=T,f=100,c={w},r={h},m={m},q=2;{chunk}\x1b\\")
-                else:
-                    parts.append(f"\x1b_Gm={m},q=2;{chunk}\x1b\\")
-            seq = "".join(parts)
-            try:
-                os.write(sys.stdout.fileno(), seq.encode("latin-1", "replace"))
-            except Exception:
-                sys.stdout.write(seq); sys.stdout.flush()
-        except Exception:
-            pass
+    # ── Rendering ──────────────────────────────────────────────────────────────
+    def render_line(self, y: int) -> Strip:
+        w = max(self.size.width, 1)
+        bg = Segment(" " * w)
 
+        if self._kitty_seq:
+            if y == 0:
+                # Emit the entire Kitty sequence as a control segment on the
+                # first line — Textual writes it at the widget's top-left,
+                # which is exactly where Kitty places the image.
+                return Strip([Segment(self._kitty_seq, None, True), bg])
+            return Strip([bg])
+
+        if self._ansi_lines:
+            if y < len(self._ansi_lines):
+                try:
+                    return Strip.from_rich_text(
+                        self._ansi_lines[y], cell_length=w)
+                except Exception:
+                    pass
+        return Strip([bg])
+
+    # ── Resize ─────────────────────────────────────────────────────────────────
     def on_resize(self, _):
         if self._png:
-            self.app.call_after_refresh(self._place_kitty)
+            self._kitty_seq = self._encode(self._png)
+        self.refresh()
 
 
 # ── Modals ─────────────────────────────────────────────────────────────────────
@@ -875,6 +894,10 @@ class StockApp(App):
             self.call_from_thread(self._draw_overview, sym)
         except Exception: pass
 
+    def _set_chart_png(self, png: bytes):
+        """UI-thread safe: set PNG on the chart widget."""
+        self.query_one("#ch-area", ChartWidget).set_png(png)
+
     def _load_hist(self, sym, tf):
         period, interval = TIMEFRAMES[tf]
         try:
@@ -885,8 +908,7 @@ class StockApp(App):
                 png = _make_mpl_chart(hist, sym, tf, self._indicator,
                                       self._chart_t, self._rate(), self._csym())
                 if png:
-                    self.call_from_thread(
-                        self.query_one("#ch-area", ChartWidget).set_png, png)
+                    self.call_from_thread(self._set_chart_png, png)
                     self.call_from_thread(self._draw_chart_ctrl)
                     self.call_from_thread(self._draw_signals, sym, tf)
                     return
@@ -1529,8 +1551,7 @@ class StockApp(App):
             png = _make_mpl_chart(hist, sym, tf, self._indicator,
                                   self._chart_t, self._rate(), self._csym())
             if png:
-                self.call_from_thread(
-                    self.query_one("#ch-area", ChartWidget).set_png, png)
+                self.call_from_thread(self._set_chart_png, png)
                 self.call_from_thread(self._draw_chart_ctrl)
                 return
         self.call_from_thread(self._draw_chart, sym, tf)
