@@ -1,3 +1,3 @@
 """stocky — professional stock market TUI for traders."""
 
-__version__ = "0.2.1"
+__version__ = "0.2.2"

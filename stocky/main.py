@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """stocky — professional stock TUI with AI analysis"""
 
-import sys, threading, io, json, os, time
+import sys, threading, io, json, os, time, base64
 from datetime import datetime
 from pathlib import Path
 from rich.ansi import AnsiDecoder
@@ -192,6 +192,157 @@ def _plt_build():
         plt.show(); sys.stdout = old
         return buf.getvalue()
 
+def _kitty_supported():
+    return os.environ.get("TERM_PROGRAM", "") in ("ghostty", "kitty") \
+        or "KITTY_WINDOW_ID" in os.environ
+
+def _make_mpl_chart(hist, sym, tf, indicator, chart_type, rate, csym):
+    """Render a matplotlib chart and return PNG bytes, or None on failure."""
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as mplt
+        import matplotlib.gridspec as gridspec
+        from matplotlib.patches import Rectangle
+    except ImportError:
+        return None
+
+    closes = [p * rate for p in hist["Close"].tolist()]
+    opens  = [p * rate for p in hist["Open"].tolist()]
+    highs  = [p * rate for p in hist["High"].tolist()]
+    lows   = [p * rate for p in hist["Low"].tolist()]
+    vols   = hist["Volume"].tolist()
+    xs     = list(range(len(closes)))
+    dates  = [str(d)[:10] for d in hist.index]
+
+    has_ind_panel = indicator in ("RSI", "MACD")
+    bg, panel, grid = "#1e1e2e", "#181825", "#313244"
+
+    if has_ind_panel:
+        fig = mplt.figure(figsize=(16, 9), facecolor=bg)
+        gs  = gridspec.GridSpec(3, 1, figure=fig, height_ratios=[4, 1, 1.8], hspace=0.04)
+        ax_p = fig.add_subplot(gs[0])
+        ax_v = fig.add_subplot(gs[1], sharex=ax_p)
+        ax_i = fig.add_subplot(gs[2], sharex=ax_p)
+    else:
+        fig = mplt.figure(figsize=(16, 9), facecolor=bg)
+        gs  = gridspec.GridSpec(2, 1, figure=fig, height_ratios=[5, 1], hspace=0.04)
+        ax_p = fig.add_subplot(gs[0])
+        ax_v = fig.add_subplot(gs[1], sharex=ax_p)
+        ax_i = None
+
+    def _style(ax):
+        ax.set_facecolor(panel)
+        ax.tick_params(colors="#6c7086", labelsize=8)
+        for spine in ax.spines.values():
+            spine.set_color(grid)
+        ax.grid(color=grid, linewidth=0.5, alpha=0.6)
+        ax.tick_params(axis="x", which="both", bottom=False)
+
+    for ax in filter(None, [ax_p, ax_v, ax_i]):
+        _style(ax)
+
+    up_clr, dn_clr = "#a6e3a1", "#f38ba8"
+    price_clr = up_clr if closes[-1] >= closes[0] else dn_clr
+
+    # ── Price panel ──────────────────────────────────────────────────────────
+    if chart_type == "candle":
+        for i, (o, c, h_, l_) in enumerate(zip(opens, closes, highs, lows)):
+            clr = up_clr if c >= o else dn_clr
+            ax_p.plot([i, i], [l_, h_], color=clr, linewidth=0.8)
+            ax_p.add_patch(Rectangle(
+                (i - 0.4, min(o, c)), 0.8, abs(c - o),
+                facecolor=clr, edgecolor=clr, linewidth=0.3))
+    else:
+        ax_p.plot(xs, closes, color=price_clr, linewidth=1.6)
+        ax_p.fill_between(xs, closes, min(closes) * 0.998,
+                          alpha=0.12, color=price_clr)
+
+    # Overlays
+    if indicator == "SMA20":
+        ax_p.plot(xs, _sma(closes, 20), color="#f9e2af", linewidth=1.1,
+                  linestyle="--", label="SMA 20")
+        ax_p.legend(facecolor=panel, edgecolor=grid,
+                    labelcolor="#cdd6f4", fontsize=8, loc="upper left")
+    elif indicator == "EMA20":
+        ax_p.plot(xs, _ema(closes, 20), color="#cba6f7", linewidth=1.1,
+                  linestyle="--", label="EMA 20")
+        ax_p.legend(facecolor=panel, edgecolor=grid,
+                    labelcolor="#cdd6f4", fontsize=8, loc="upper left")
+    elif indicator == "BB":
+        lo_, mid_, hi_ = _bb(closes)
+        ax_p.plot(xs, hi_,  color=dn_clr, linewidth=0.8, linestyle="--", label="BB+")
+        ax_p.plot(xs, mid_, color="#89b4fa", linewidth=0.8, label="mid")
+        ax_p.plot(xs, lo_,  color=up_clr,  linewidth=0.8, linestyle="--", label="BB−")
+        ax_p.fill_between(xs, lo_, hi_, alpha=0.07, color="#89b4fa")
+        ax_p.legend(facecolor=panel, edgecolor=grid,
+                    labelcolor="#cdd6f4", fontsize=8, loc="upper left")
+
+    ret = (closes[-1] - closes[0]) / closes[0] * 100 if closes[0] else 0
+    ret_s = f"{ret:+.2f}%"
+    ax_p.set_title(
+        f"  {sym}  ·  {tf}  ·  {csym}{closes[-1]:,.2f}  ({ret_s})",
+        color="#cdd6f4", fontsize=11, fontweight="bold", loc="left", pad=6)
+    ax_p.set_ylabel(csym, color="#6c7086", fontsize=8)
+    ax_p.yaxis.set_tick_params(labelcolor="#6c7086")
+    ax_p.xaxis.set_tick_params(labelcolor="#6c7086")
+
+    # ── Date ticks ───────────────────────────────────────────────────────────
+    n_ticks = min(9, len(dates))
+    step    = max(1, len(dates) // n_ticks)
+    locs    = list(range(0, len(dates), step))
+    for ax in filter(None, [ax_p, ax_v, ax_i]):
+        ax.set_xticks(locs)
+    ax_p.set_xticklabels([])
+    if ax_i:
+        ax_v.set_xticklabels([])
+        ax_i.set_xticklabels([dates[i] for i in locs],
+                              rotation=25, ha="right", color="#6c7086", fontsize=7)
+    else:
+        ax_v.set_xticklabels([dates[i] for i in locs],
+                              rotation=25, ha="right", color="#6c7086", fontsize=7)
+
+    # ── Volume panel ─────────────────────────────────────────────────────────
+    vol_clrs = [up_clr if i == 0 or closes[i] >= closes[i-1] else dn_clr
+                for i in range(len(closes))]
+    ax_v.bar(xs, vols, color=vol_clrs, alpha=0.85, width=0.85)
+    ax_v.set_ylabel("Vol", color="#6c7086", fontsize=7)
+    ax_v.yaxis.set_tick_params(labelcolor="#6c7086", labelsize=7)
+
+    # ── Indicator panel ───────────────────────────────────────────────────────
+    if ax_i:
+        if indicator == "RSI":
+            rsi = _rsi(closes)
+            ax_i.plot(xs, rsi, color="#f9e2af", linewidth=1.2)
+            ax_i.axhline(70, color=dn_clr, linewidth=0.8, linestyle="--", alpha=0.7)
+            ax_i.axhline(30, color=up_clr, linewidth=0.8, linestyle="--", alpha=0.7)
+            ax_i.axhline(50, color=grid, linewidth=0.5, linestyle=":")
+            ax_i.fill_between(xs, 70, rsi,
+                              where=[v > 70 for v in rsi], color=dn_clr, alpha=0.2)
+            ax_i.fill_between(xs, 30, rsi,
+                              where=[v < 30 for v in rsi], color=up_clr, alpha=0.2)
+            ax_i.set_ylim(0, 100)
+            ax_i.set_ylabel("RSI", color="#6c7086", fontsize=7)
+        elif indicator == "MACD":
+            m_, sig_, hist_ = _macd(closes)
+            ax_i.plot(xs, m_,    color="#89b4fa",  linewidth=1.1, label="MACD")
+            ax_i.plot(xs, sig_,  color="#f9e2af",  linewidth=1.1, label="Signal")
+            bar_clrs = [up_clr if v >= 0 else dn_clr for v in hist_]
+            ax_i.bar(xs, hist_, color=bar_clrs, alpha=0.65, width=0.85)
+            ax_i.axhline(0, color=grid, linewidth=0.5)
+            ax_i.set_ylabel("MACD", color="#6c7086", fontsize=7)
+            ax_i.legend(facecolor=panel, edgecolor=grid,
+                        labelcolor="#cdd6f4", fontsize=7, loc="upper left")
+        ax_i.yaxis.set_tick_params(labelcolor="#6c7086", labelsize=7)
+
+    fig.tight_layout(pad=0.6)
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=120,
+                bbox_inches="tight", facecolor=fig.get_facecolor())
+    mplt.close(fig)
+    return buf.getvalue()
+
+
 def _stream_claude(system, messages, on_text, on_done, on_error):
     """Stream a Claude response via the `claude` CLI (uses existing login).
     Calls on_text(chunk) for each text delta, on_done() when finished,
@@ -313,6 +464,60 @@ def _build_stock_context(sym, info, hist, signals_data, financials):
         ]
 
     return "\n".join(lines)
+
+
+# ── Chart widget (Kitty graphics + plotext fallback) ───────────────────────────
+class ChartWidget(Static):
+    """Renders either a matplotlib PNG via Kitty protocol or plotext text."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._png: bytes | None = None
+
+    def set_png(self, png: bytes):
+        self._png = png
+        self.update("")      # clear any old plotext text
+        self.refresh()
+
+    def set_plotext(self, text):
+        self._png = None
+        self.update(text)
+
+    def render(self):
+        if self._png:
+            self.app.call_after_refresh(self._place_kitty)
+            return ""
+        return super().render()
+
+    def _place_kitty(self):
+        if not self._png:
+            return
+        try:
+            r = self.region
+            w, h = r.width, r.height
+            if w <= 0 or h <= 0:
+                return
+            data   = base64.standard_b64encode(self._png).decode()
+            chunks = [data[i:i + 4096] for i in range(0, len(data), 4096)]
+            parts  = [f"\x1b[{r.y + 1};{r.x + 1}H"]
+            for i, chunk in enumerate(chunks):
+                m = 0 if i == len(chunks) - 1 else 1
+                if i == 0:
+                    parts.append(
+                        f"\x1b_Ga=T,f=100,c={w},r={h},m={m},q=2;{chunk}\x1b\\")
+                else:
+                    parts.append(f"\x1b_Gm={m},q=2;{chunk}\x1b\\")
+            seq = "".join(parts)
+            try:
+                os.write(sys.stdout.fileno(), seq.encode("latin-1", "replace"))
+            except Exception:
+                sys.stdout.write(seq); sys.stdout.flush()
+        except Exception:
+            pass
+
+    def on_resize(self, _):
+        if self._png:
+            self.app.call_after_refresh(self._place_kitty)
 
 
 # ── Modals ─────────────────────────────────────────────────────────────────────
@@ -544,7 +749,7 @@ class StockApp(App):
                     # Tab 2: Chart + technical signals
                     with TabPane("Chart", id="tab-chart"):
                         yield Static("", id="ch-ctrl")
-                        yield Static("", id="ch-area")
+                        yield ChartWidget(id="ch-area")
                         yield Static("", id="sig-area")
                     # Tab 3: Options chain
                     with TabPane("Options", id="tab-options"):
@@ -676,6 +881,15 @@ class StockApp(App):
             hist = yf.Ticker(sym).history(period=period, interval=interval)
             with self._lock:
                 self._hist_cache[(sym, tf)] = hist
+            if _kitty_supported():
+                png = _make_mpl_chart(hist, sym, tf, self._indicator,
+                                      self._chart_t, self._rate(), self._csym())
+                if png:
+                    self.call_from_thread(
+                        self.query_one("#ch-area", ChartWidget).set_png, png)
+                    self.call_from_thread(self._draw_chart_ctrl)
+                    self.call_from_thread(self._draw_signals, sym, tf)
+                    return
             self.call_from_thread(self._draw_chart, sym, tf)
             self.call_from_thread(self._draw_signals, sym, tf)
         except Exception as exc:
@@ -916,9 +1130,16 @@ class StockApp(App):
 
     def _draw_chart(self, sym, tf):
         hist = self._hist_cache.get((sym, tf))
-        cw   = self.query_one("#ch-area")
+        cw   = self.query_one("#ch-area", ChartWidget)
         if hist is None or hist.empty:
-            cw.update("No chart data"); return
+            cw.set_plotext("No chart data"); return
+        if _kitty_supported():
+            png = _make_mpl_chart(hist, sym, tf, self._indicator,
+                                  self._chart_t, self._rate(), self._csym())
+            if png:
+                cw.set_png(png)
+                self._draw_chart_ctrl()
+                return
         try:
             rate   = self._rate()
             closes = [p*rate for p in hist["Close"].tolist()]
@@ -1032,9 +1253,9 @@ class StockApp(App):
 
             chart_str = _plt_build()
             self._draw_chart_ctrl()
-            cw.update("\n".join(str(l) for l in _ansi.decode(chart_str)))
+            cw.set_plotext("\n".join(str(l) for l in _ansi.decode(chart_str)))
         except Exception as exc:
-            cw.update(f"Chart error: {exc}")
+            cw.set_plotext(f"Chart error: {exc}")
 
     def _draw_chart_ctrl(self):
         parts = []
@@ -1255,7 +1476,7 @@ class StockApp(App):
 
     def on_resize(self, _):
         key = (self._cur_sym, self._cur_tf)
-        if key in self._hist_cache: self._draw_chart(*key)
+        if key in self._hist_cache: self._regen_chart_bg(*key)
 
     # ── Actions ─────────────────────────────────────────────────────────────────
     def action_add_ticker(self):
@@ -1292,25 +1513,44 @@ class StockApp(App):
         sym = self._cur_sym
         for s in self._cur_wl: self.call_from_thread(self._draw_wl_item, s)
         self.call_from_thread(self._draw_details, sym)
-        self.call_from_thread(self._draw_chart, sym, self._cur_tf)
+        self._regen_chart_bg(sym, self._cur_tf)
         self.call_from_thread(self._draw_portfolio)
+
+    def _regen_chart_bg(self, sym, tf):
+        """Regenerate chart in background (use when settings change)."""
+        threading.Thread(
+            target=self._regen_chart_thread, args=(sym, tf), daemon=True).start()
+
+    def _regen_chart_thread(self, sym, tf):
+        hist = self._hist_cache.get((sym, tf))
+        if hist is None or hist.empty:
+            return
+        if _kitty_supported():
+            png = _make_mpl_chart(hist, sym, tf, self._indicator,
+                                  self._chart_t, self._rate(), self._csym())
+            if png:
+                self.call_from_thread(
+                    self.query_one("#ch-area", ChartWidget).set_png, png)
+                self.call_from_thread(self._draw_chart_ctrl)
+                return
+        self.call_from_thread(self._draw_chart, sym, tf)
 
     def action_toggle_chart(self):
         self._chart_t = "candle" if self._chart_t == "line" else "line"
         key = (self._cur_sym, self._cur_tf)
-        if key in self._hist_cache: self._draw_chart(*key)
+        if key in self._hist_cache: self._regen_chart_bg(*key)
 
     def action_cycle_ind(self):
         self._ind_idx   = (self._ind_idx+1) % len(INDICATORS)
         self._indicator = INDICATORS[self._ind_idx]
         key = (self._cur_sym, self._cur_tf)
-        if key in self._hist_cache: self._draw_chart(*key)
+        if key in self._hist_cache: self._regen_chart_bg(*key)
 
     def _switch_tf(self, tf):
         self._cur_tf = tf; self._draw_chart_ctrl()
         key = (self._cur_sym, tf)
         if key in self._hist_cache:
-            self._draw_chart(*key)
+            self._regen_chart_bg(*key)
             self._draw_signals(*key)
         else:
             self._status(f"Loading {tf}…")
