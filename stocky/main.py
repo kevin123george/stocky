@@ -533,11 +533,25 @@ class ChartWidget(Widget):
                     pass
         return Strip([bg])
 
-    # ── Resize ─────────────────────────────────────────────────────────────────
+    # ── Visibility / resize ────────────────────────────────────────────────────
     def on_resize(self, _):
         if self._png:
             self._kitty_seq = self._encode(self._png)
         self.refresh()
+
+    def on_hide(self):
+        """Delete all Kitty images when this widget is hidden (tab switch)."""
+        if self._kitty_seq:
+            try:
+                os.write(sys.stdout.fileno(), b"\x1b_Ga=d,d=A,q=2\x1b\\")
+            except Exception:
+                pass
+
+    def on_show(self):
+        """Re-render when the widget becomes visible again."""
+        if self._png:
+            self._kitty_seq = self._encode(self._png)
+            self.refresh()
 
 
 # ── Modals ─────────────────────────────────────────────────────────────────────
