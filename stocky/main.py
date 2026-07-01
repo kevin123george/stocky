@@ -13,6 +13,7 @@ from textual.widgets import (
     Static, ListView, ListItem, Label, Footer, Header,
     Input, DataTable, TabbedContent, TabPane, Button,
 )
+from textual.widget import Widget
 from textual.containers import Horizontal, Vertical, ScrollableContainer
 from textual.binding import Binding
 from textual.screen import ModalScreen
